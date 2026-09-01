@@ -1,0 +1,1824 @@
+---
+title: "GG6581 Offshore Wind Energy Assignment"
+author: "Michael Allen"
+date: "24-07-2026"
+output: 
+  pdf_document:
+    latex_engine: xelatex     # ← This is the key fix
+    keep_tex: false
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  dpi = 200
+)
+
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+```
+
+## Install packages
+
+```{r load-packages, include=TRUE}
+# ====================== PACKAGES ======================
+pkgs <- c(
+  "readxl", "ncdf4", "cmsaf", "data.table",
+  "ggplot2", "magrittr", "plyr", "dplyr", "utils", "naniar",
+  "lubridate", "raster", "tidyverse", "imputeTS", "readr",
+  "broman", "car", "tidyr", "extRemes", "grDevices",
+  "splitstackshape", "TideHarmonics", "viridis", "DT",
+  "webshot", "htmltools", "knitr", "here"
+)
+
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+
+# Install missing CRAN packages
+new_pkgs <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if (length(new_pkgs) > 0) {
+  message("Installing: ", paste(new_pkgs, collapse = ", "))
+  install.packages(new_pkgs, dependencies = TRUE)
+}
+
+# Special: rWind was removed from CRAN → install from GitHub archive
+if (!requireNamespace("rWind", quietly = TRUE)) {
+  if (!requireNamespace("remotes", quietly = TRUE)) {
+    install.packages("remotes")
+  }
+  remotes::install_github("jabiologo/rWind")
+}
+
+# Load all packages
+invisible(lapply(pkgs, library, character.only = TRUE))
+library(rWind)   # load separately
+
+cat("✅ All packages loaded successfully (including rWind from GitHub).\n")
+```
+
+## Download ERA5 data for Lí Ban Offshore Wind Farm
+
+``` {r load-script_Download_ERA5_data, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+
+ecmwfr::wf_set_key(key = "3dd19e02-dad8-42a3-b1fd-dec150098abb", user = "95694862@umail.ucc.ie")
+
+# 4. Create a function to download multiple ERA5 variables from the dataset 'Reanalysis ERA5 Single Levels'
+download_era5_single_levels_nc <- function(shape = NULL,
+                                             lat,
+                                             lon,
+                                             buffer = 0.5,
+                                             variable = c("10m_u_component_of_wind",
+                                                          "10m_v_component_of_wind",
+                                                          "100m_u_component_of_wind",
+                                                          "100m_v_component_of_wind",
+                                                          "mean_sea_level_pressure",
+                                                          "sea_surface_temperature",
+                                                          "mean_wave_period",
+                                                          "mean_wave_direction",
+                                                          "peak_wave_period",
+                                                          "significant_height_of_combined_wind_waves_and_swell"),#add more variable as per ERA5 documentation
+                                             year = 2022,
+                                             month = 1:12,
+                                             site  = "test",
+                                             user = NULL,
+                                             era5_dataset = "reanalysis-era5-single-levels",
+                                             path = ".",
+                                             subfolder = "era5_downloads") {
+  
+  # Main download folder
+  main_path <- file.path(path, subfolder)
+  if (!dir.exists(main_path)) {
+    dir.create(main_path, recursive = TRUE)
+  }
+  
+  time <- sprintf("%02d:00", 0:23)
+  timestep <- "hourly"
+  
+  if (!is.null(shape)) {
+    bbox <- shape |> sf::st_bbox()
+    area <- c(plyr::round_any(bbox["ymax"], 0.5, ceiling),
+              plyr::round_any(bbox["xmin"], 0.5, floor),
+              plyr::round_any(bbox["ymin"], 0.5, floor),
+              plyr::round_any(bbox["xmax"], 0.5, ceiling))
+  } else {
+    area <- c(plyr::round_any(lat + buffer, 0.5, ceiling),
+              plyr::round_any(lon - buffer, 0.5, floor),
+              plyr::round_any(lat - buffer, 0.5, floor),
+              plyr::round_any(lon + buffer, 0.5, ceiling))
+  }
+  
+  request_list <- list()
+  
+  for (v in variable) {
+    # Create folder for this variable inside the subfolder
+    var_folder <- v
+    dir.create(file.path(main_path, var_folder), recursive = TRUE, showWarnings = FALSE)
+    
+    for (y in year) {
+      for (m in month) {
+        list_name <- paste0(v, "_", y, "_", m)
+        
+        # TARGET is relative to main_path (no subfolder)
+        target_file <- file.path(
+          var_folder,
+          paste0(era5_dataset, "_", v, "_", timestep, "_", y, "_", m, "_", site, ".nc")
+        )
+        
+        request_list[[list_name]] <- list(
+          dataset_short_name = era5_dataset,
+          product_type       = "reanalysis",
+          download_format    = "unarchived",
+          data_format        = "netcdf",
+          variable           = v,
+          year               = y,
+          month              = m,
+          day                = sprintf("%02d", 1:31),
+          time               = time,
+          area               = area,
+          target             = target_file
+        )
+      }
+    }
+  }
+  
+  # Check requests
+  lapply(request_list, ecmwfr::wf_check_request)
+  
+  # Batch download
+  req <- ecmwfr::wf_request_batch(
+    request_list = request_list,
+    path = main_path,
+    user = user,
+    workers = length(request_list)
+  )
+  
+  return(req)
+}
+
+# 5. Define your input criteria into your newly created function
+lat <- 51.795
+lon <- -7.5
+year <- 2024
+month <- 1:2
+variable <- c("100m_u_component_of_wind", "100m_v_component_of_wind")
+path <- "data/"
+user <- "95694862@umail.ucc.ie"
+
+
+# 6. Use the function to download the required NetCDF files.
+if (FALSE) {
+  files <- download_era5_single_levels_nc(
+    lat = lat,
+    lon = lon,
+    year = year,
+    month = month,
+    variable = variable,
+    path = path,
+    user = user 
+  )
+files
+}
+
+```
+
+### Extract data from NetCDF files
+``` {r load-script_Extract_data, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+#Scenario 1:
+# Extract a time-series from the closest grid point in the NetCDF using one target input co-ordinate
+# Assuming only 1 input NetCDF file
+# Assuming only 1 variable in the NetCDF alongside long, lat, and time
+
+#1. install the required packages
+install.packages(c("ncdf4"))
+
+#2. load the required packages
+library(ncdf4)
+
+
+#3. define site specific information
+nc_file <- "data/era5_downloads/100m_u_component_of_wind/reanalysis-era5-single-levels_100m_u_component_of_wind_hourly_2024_1_test.nc" #Define location of input file
+varname <- "u100"      # Define variable of interest. In this case is Tp. Short name in ERA5 is pp1d.
+target_lon <- -7.2     # define target location
+target_lat <- 51.1
+
+
+#4. open the NetCDF File
+nc <- nc_open(nc_file)
+print(nc)
+
+
+#5. extract coordinates
+lon <- ncvar_get(nc, "longitude")
+lat <- ncvar_get(nc, "latitude")
+time <- ncvar_get(nc, "valid_time") #The time variable in ERA5 NetCDF files is labelled 'valid_time' rather than 'time'
+# If using a non-ERA5 NetCDF, the variable may be named differently
+
+
+#6. convert time to actual dates
+time_units <- ncatt_get(nc, "valid_time", "units")$value
+time_origin <- sub(".*since ", "", time_units)
+time_dates <- as.POSIXct(time, origin = time_origin, tz = "UTC")
+
+
+#7. find nearest grid cell to your point
+lon_idx <- which.min(abs(lon - target_lon))
+lat_idx <- which.min(abs(lat - target_lat))
+
+lon_idx
+lat_idx
+
+
+#8. extract the time Series
+ts <- ncvar_get(nc, varname,
+start = c(lon_idx, lat_idx, 1),
+count = c(1, 1, -1))
+
+#9.Put it into a data frame
+df <- data.frame(
+  datetime    = time_dates,
+  value       = ts,
+  closest_lon = lon[lon_idx],
+  closest_lat = lat[lat_idx]
+)
+
+names(df)[names(df) == "value"] <- varname
+
+head(df)
+
+
+#10. close file
+nc_close(nc)
+
+#11. save as csv file
+write.csv(df, "output/new_netcdf.csv")
+```
+### 1.1 Study Area
+
+**https://www.gov.ie/en/department-of-climate-energy-and-the-environment/press-releases/minister-ryan-publishes-draft-plan-identifying-proposed-areas-off-the-south-coast-suitable-for-offshore-wind-projects/**
+
+The study area selected for this assessment is the Lí Ban Offshore Wind Farm (Maritime Area B), situated in the Celtic Sea off the south coast of Ireland. The site forms one of four designated offshore wind development areas identified within Ireland's South Coast Designated Maritime Area Plan (SC-DMAP) and has been prioritised by the Irish Government for large-scale renewable energy development. The central coordinates of the study area are approximately 51.795° N, located approximately 29 km offshore from County Waterford at its closest point, with the western extent situated approximately 49 km from the Irish coastline.
+
+The location was selected because it represents a realistic commercial offshore wind development site currently progressing through Ireland's offshore renewable energy programme. The site benefits from excellent wind resources due to its exposure to the prevailing south-westerly winds of the North Atlantic while also experiencing energetic Atlantic wave conditions representative of the wider Celtic Sea. These characteristics make the site well suited for demonstrating the metocean analyses required during the early stages of offshore wind farm planning.
+
+Water depths across the Lí Ban site generally fall within the range suitable for fixed-bottom offshore wind technology, although detailed bathymetric and geotechnical investigations would ultimately determine foundation selection. The combination of favourable wind resources, appropriate water depths and strategic location within a government-designated offshore renewable energy zone makes the site representative of current offshore wind developments proposed around the Irish coast.
+
+### 1.2 Selection of Study Area
+
+The primary objective of an early-stage site characterisation study is to establish whether a location possesses sufficient environmental and metocean conditions to justify further engineering investigation. The Lí Ban offshore wind development area was selected because it satisfies several important criteria required for preliminary assessment.
+
+Firstly, the site is located within a nationally designated offshore renewable energy development area, ensuring that the assessment is directly relevant to current Irish offshore energy policy. Secondly, the location is sufficiently offshore to experience open-ocean wind and wave conditions while remaining close enough to shore to facilitate construction, operation and maintenance activities. Thirdly, the Celtic Sea possesses one of the highest offshore wind resources in Europe, making the area particularly suitable for renewable electricity generation.
+
+From a data perspective, the site is well supported by publicly available datasets, including ERA5 atmospheric reanalysis, Copernicus Marine Service oceanographic products, INFOMAR bathymetric surveys and global tidal models. These datasets provide adequate coverage for feasibility-level assessments while recognising that higher-resolution site-specific observations would be required during detailed engineering design.
+
+### 1.3 Available Metocean Data
+
+| Variable     | Dataset                   | Coverage         | Temporal Resolution | Spatial Resolution | Primary Use            
+
+| Wind         | ERA5 Reanalysis           | 1940–Present     | Hourly              | ~31 km             | Wind resource assessment |
+| Waves        | ERA5 Reanalysis           | 1940–Present     | Hourly              | ~31 km             | Wave climate             |
+| Currents     | Copernicus Marine Service | Multi-year       | Hourly              | ~8–9 km            | Current assessment       |
+| Water Levels | TPXO/FES2014              | Harmonic         | Tidal constituents  | Global             | Tidal analysis           |
+| Bathymetry   | INFOMAR                   | Survey dependent | Static              | High resolution    | Site characterisation    |
+
+``` {r Metocean-Data-script, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(gt)
+library(dplyr)
+
+metocean_datasets <- tibble(
+  Variable = c("Wind",
+               "Waves",
+               "Currents",
+               "Water Levels",
+               "Bathymetry"),
+  
+  Dataset = c("ERA5 Reanalysis",
+              "ERA5 Reanalysis",
+              "Copernicus Marine Service",
+              "TPXO / FES2014",
+              "INFOMAR Bathymetry"),
+  
+  `Time Period` = c("1940–Present",
+                    "1940–Present",
+                    "Multi-year",
+                    "Long-term harmonic constituents",
+                    "Survey dependent"),
+  
+  `Temporal Resolution` = c("Hourly",
+                            "Hourly",
+                            "Hourly",
+                            "Astronomical constituents",
+                            "Static"),
+  
+  `Spatial Resolution` = c("~31 km",
+                           "~31 km",
+                           "~8 km",
+                           "Global model",
+                           "High resolution"),
+  
+  `Primary Application` = c("Wind resource assessment",
+                            "Wave climate assessment",
+                            "Current climate assessment",
+                            "Tidal analysis",
+                            "Site bathymetry")
+)
+
+metocean_datasets %>%
+  gt() %>%
+  tab_header(
+    title = md("**Table 1. Available Metocean Datasets for the Lí Ban Offshore Wind Farm Site**"),
+    subtitle = "Publicly available datasets used for preliminary site characterisation."
+  ) %>%
+  cols_label(
+    Variable = "Variable",
+    Dataset = "Dataset",
+    `Time Period` = "Coverage",
+    `Temporal Resolution` = "Temporal Resolution",
+    `Spatial Resolution` = "Spatial Resolution",
+    `Primary Application` = "Primary Application"
+  ) %>%
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 15,
+    heading.subtitle.font.size = 11,
+    table.width = pct(100),
+    data_row.padding = px(5)
+  ) %>%
+  opt_row_striping() %>%
+  tab_source_note(
+    source_note = md("*Sources: Copernicus Climate Change Service (ERA5), Copernicus Marine Service, INFOMAR, TPXO/FES2014.*")
+  )
+```
+
+``` {r Data-Gap-Analysis-table-script, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+data_gap <- tibble(
+  Variable = c("Wind",
+               "Waves",
+               "Currents",
+               "Water Levels",
+               "Bathymetry"),
+
+  Dataset = c("ERA5",
+              "ERA5",
+              "Copernicus Marine",
+              "TPXO / FES2014",
+              "INFOMAR"),
+
+  `Suitable for Early Stage` = c("✓ Excellent",
+                                 "✓ Excellent",
+                                 "✓ Good",
+                                 "✓ Good",
+                                 "✓ Excellent"),
+
+  `Suitable for Detailed Design` = c("✗ No",
+                                     "✗ No",
+                                     "△ Limited",
+                                     "△ Limited",
+                                     "✓ Yes"),
+
+  Limitation = c(
+    "Resolution too coarse to resolve local wind flow and turbulence.",
+    "Storm extremes and nearshore transformation may be underestimated.",
+    "Limited representation of local tidal asymmetry and seabed effects.",
+    "Astronomical tides only; meteorological surge not included.",
+    "Coverage varies between survey areas."
+  )
+)
+
+data_gap %>%
+  gt() %>%
+  tab_header(
+    title = md("**Table 2. Metocean Data Gap Analysis**"),
+    subtitle = "Assessment of publicly available datasets for offshore wind site characterisation."
+  ) %>%
+  cols_width(
+    Limitation ~ px(330)
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) %>%
+  opt_row_striping() %>%
+  tab_source_note(
+    source_note = md("*Author assessment based on publicly available metocean datasets.*")
+  )
+```
+
+## Section 2 – Data Cleaning and Preparation
+
+### 2.1 Dataset Acquisition
+
+The datasets used in this study were obtained from publicly available sources suitable for offshore wind feasibility assessments. Atmospheric variables, including the eastward (U10) and northward (V10) wind components together with significant wave height (Hs), peak wave period (Tp) and mean wave direction (MWD), were extracted from the ERA5 reanalysis dataset. Ocean current velocities were obtained from the Copernicus Marine Service, while tidal constituents were derived from a global harmonic tide model. Bathymetric information was sourced from the INFOMAR programme to provide an overview of seabed conditions within the study area.
+
+All datasets were extracted at the grid point nearest the centre of the Lí Ban Offshore Wind Farm site (51.795° N) and converted into a common tabular format to facilitate subsequent statistical analysis.
+
+### 2.2 Data Quality Assessment
+``` {r Data-Quality-Assessment-script, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+
+quality_summary <- tibble(
+  Variable = names(df),
+  Missing = sapply(df, function(x) sum(is.na(x))),
+  Missing_Percent = round(
+    sapply(df, function(x) mean(is.na(x))*100),2)
+)
+
+quality_summary
+```
+
+A quality assessment was undertaken to identify missing observations and inconsistencies prior to analysis. The ERA5 and Copernicus datasets contained a negligible proportion of missing values, reflecting the continuous nature of reanalysis products. Variables exhibiting missing values were inspected to ensure that these occurred only at isolated timestamps and therefore did not influence the long-term climatological statistics presented in this report.
+
+There are no missing values and no gap filling was required.
+
+```{r load-wind-data, message=FALSE, warning=FALSE}
+library(readr)
+
+wind <- read.csv("data/modelled/era5_wind_10m.csv")
+# or:
+# wind <- read_csv("data/modelled/era5_wind_10m.csv")
+```
+
+### 2.3 Data Cleaning
+
+``` {r wind-script, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+wind <- wind %>%
+  distinct() %>%
+  mutate(
+    Date = ymd_hms(datetime),
+    Year = year(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE)
+  )
+
+wind <- wind %>%
+mutate(
+Speed10 = sqrt(u10^2 + v10^2),
+
+Direction =
+(270 - atan2(v10,u10)*180/pi) %%360
+)
+```
+
+Wind components supplied by ERA5 are provided as eastward and northward vector components. These were converted into scalar wind speed and meteorological wind direction using standard vector transformations.
+
+### 2.4 Wind Speed Extrapolation
+
+``` {r wind-script1, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+alpha <- 0.11
+
+wind <- wind %>%
+mutate(
+V150 = Speed10*(150/10)^alpha
+)
+```
+
+Wind observations from ERA5 are available at 10 m above sea level, whereas modern offshore wind turbines typically operate with hub heights between 120 m and 170 m. Consequently, wind speeds were extrapolated to a representative hub height of 150 m using the power-law profile. Although this simplified approach assumes a constant shear exponent, it provides an appropriate approximation during the preliminary design stage
+
+### 2.5 Final Prepared Dataset
+
+``` {r wind-script2, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+prepared_data <- tibble(
+Variable=c(
+"Wind Speed 10 m",
+"Wind Speed 150 m",
+"Wind Direction",
+"Hs",
+"Tp",
+"MWD",
+"Current Speed",
+"Current Direction"
+),
+
+Unit=c(
+"m/s",
+"m/s",
+"degrees",
+"m",
+"s",
+"degrees",
+"m/s",
+"degrees"
+),
+
+Status="Ready for Analysis"
+)
+
+prepared_data %>%
+gt() %>%
+tab_header(
+title="Table 4. Variables Included in the Final Analysis Dataset"
+)
+```
+
+Following quality control and preprocessing, all datasets were transformed into a consistent analytical framework suitable for statistical analysis. Wind vectors were converted to speed and direction, hub-height wind speeds were estimated using an offshore power-law profile, and temporal variables were standardised to facilitate annual and monthly summaries. The resulting dataset provides a coherent basis for assessing the metocean characteristics of the Lí Ban Offshore Wind Farm site during the early stages of project development.
+
+## Section 3: Data analysis
+
+### Section 3a: Wind
+
+#### Step 1 – Prepare the dataset
+
+``` {r wind-script3, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+alpha <- 0.11
+
+wind <- wind %>%
+  mutate(
+    Date = parse_date_time(datetime,
+                           orders = c("ymd HMS", "ymd")),
+    Year = year(Date),
+    Month = month(Date, label = TRUE),
+    Wind10 = wind_speed,
+    Wind150 = Wind10 * (150 / 10)^alpha
+  )
+```
+
+### Step 2 – Annual Statistics
+``` {r load-script, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(gt)
+
+annual_stats <- tibble(
+
+Statistic=c(
+"Mean",
+"Median",
+"Minimum",
+"Maximum",
+"Standard Deviation",
+"95th Percentile"),
+
+`10 m`=c(
+
+mean(wind$Wind10),
+median(wind$Wind10),
+min(wind$Wind10),
+max(wind$Wind10),
+sd(wind$Wind10),
+quantile(wind$Wind10,.95)
+
+),
+
+`150 m`=c(
+
+mean(wind$Wind150),
+median(wind$Wind150),
+min(wind$Wind150),
+max(wind$Wind150),
+sd(wind$Wind150),
+quantile(wind$Wind150,.95)
+
+)
+
+)
+
+annual_stats |>
+gt() |>
+fmt_number(columns=2:3, decimals=2) |>
+tab_header(
+title="Table 5. Annual Wind Speed Statistics"
+)
+```
+
+The annual wind speed statistics indicate a highly energetic offshore wind climate at the Lí Ban site. Mean wind speeds increase substantially between the 10 m reference height and the extrapolated 150 m hub height owing to reduced surface friction. The relatively high 95th percentile values indicate frequent periods of elevated winds during Atlantic storm events, confirming the site's suitability for commercial offshore wind generation while also highlighting the need to consider extreme loading conditions during turbine design.
+
+### Step 3 – Monthly Statistics
+
+``` {r load-script1, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+monthly_stats <-
+wind |>
+group_by(Month) |>
+summarise(
+
+Mean10=mean(Wind10),
+
+Mean150=mean(Wind150),
+
+SD10=sd(Wind10),
+
+Max10=max(Wind10)
+
+)
+
+monthly_stats |>
+gt() |>
+fmt_number(everything(),decimals=2) |>
+tab_header(
+title="Table 6. Monthly Wind Statistics"
+)
+```
+
+### Step 4 – Wind Rose
+
+```{r wind-rose, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE, fig.cap="Wind rose (10 m above sea level)"}
+
+# Load packages
+library(openair)
+
+# Import wind data
+#wind <- read.csv('data/modelled/era5_wind_10m.csv')
+
+# Optional: check data
+# colnames(wind)
+# str(wind)
+
+# Create and display wind rose (this will automatically show in Rmd)
+windRose(wind, 
+         ws = "wind_speed", 
+         wd = "wind_dir_from", 
+         angle = 22.5, 
+         breaks = 6, 
+         ws.int = 4, 
+         calm.thresh = 0, 
+         dig.lab = 1,
+         width = 1.5, 
+         key.footer = "wind speed (m/s)", 
+         annotate = FALSE, 
+         main = 'Wind rose (10 m above sea level)',
+         ylab = 'Counts by wind direction (%)')
+
+# Save high-quality version for reports (optional but recommended)
+ggsave("output/windrose_plot.png", 
+       width = 10, height = 10, dpi = 300, units = "in")
+```
+
+```{r fig.cap="Figure 3. Wind rose at 10 m above sea level showing the frequency distribution of wind speed and direction."}
+windRose(
+  wind,
+  ws="wind_speed",
+  wd="wind_dir_from",
+  angle=22.5,
+  breaks=6,
+  ws.int=4,
+  calm.thresh=0,
+  annotate=FALSE,
+  main="Wind rose (10 m above sea level)"
+)
+```
+
+The wind rose demonstrates a clear predominance of south-westerly winds, reflecting the influence of the North Atlantic storm track. Winds from the south-west and west account for the largest proportion of observations and also contain the highest wind speed classes. Easterly winds occur relatively infrequently and are generally associated with lower wind speeds.
+
+### Step 5 – Exceedance Table
+
+```{r load-script7, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+#This is an example piece of code for wind speed.
+# For other datasets e.g., wave heights and current speed, change thresholds accordingly
+
+# import wind file
+wind <- read.csv('data/modelled/era5_wind_10m.csv')
+
+# check column names
+colnames(wind)
+
+# Define speed thresholds for exceedance calculation
+thresholds <- seq(0, 20, by = 2) # defining thresholds from 0 to 20 m/s at 2 m/s intervals
+
+# Calculate % exceedance for each threshold
+exceedance <- sapply(thresholds, function(thresh) {
+  mean(wind$wind_speed > thresh) * 100
+})
+
+# Create a data frame for the table
+exceedance_table <- data.frame(
+  Threshold = thresholds,
+  Percent_Exceedance = exceedance
+)
+
+print(exceedance_table)
+
+# Export as CSV file
+write.csv(exceedance_table, 'output/exceedance_wind_speed_table.csv')
+```
+
+### Step 6 – Scatter Plot + Kernel Density
+
+```{r Scatter-plot, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE, fig.cap="Scatter plot - wave data"}
+#load packages
+library(tidyverse)
+library(magrittr)
+
+# import data
+wave <- read.csv('data/modelled/wave_compiled.csv')
+colnames(wave)
+
+# Bin wave height into categories
+wave <- wave %>%
+  mutate(height_bin = cut(hs, breaks = seq(0, 16, by = 2), include.lowest = TRUE))
+
+# Scatter Diagram for Incident wave conditions and Kernel Density
+#color palette
+cols <- rev(rainbow(20)[-c(3, 6, 8,  10, 12, 13, 14, 16, 17, 18, 19, 20)])
+
+plot_kernel <- ggplot(wave, aes(x=tp, y=hs)) + xlab("Peak wave period (Tp) (s)") +
+  ylab("Significant wave height (Hs) (m)") +
+  geom_bin2d(bins = 110, aes(fill = after_stat(count))) +
+  labs(fill = "Number of Occurrences") +
+  scale_fill_gradientn(colours=cols, breaks = c(1,500, 1000, 1500, 2000, 2500))+  # Numbers in this line should be changed for each project. 
+  theme_bw() + 
+  scale_x_continuous(expand = c(0, 0), limits = c(0,30)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 16)) + 
+  ggtitle("Tp (s) vs Hs (m)") +
+  theme_linedraw()+
+  theme(plot.title = element_text(hjust = 0.5), legend.text = element_text(size = 10))+
+  guides(fill = guide_colorbar(barwidth = 1, barheight = 6))
+plot_kernel # print the plot so you can visualise it & check for errors
+
+ggsave(plot_kernel, file="output/hs_tp_kernel_density.jpeg", dpi = 600, height = 5, width = 7, units = c("in"))
+```
+
+### Step 7 – 50-Year Extreme Wind
+
+``` {r load-script3, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+alpha <- 0.11
+
+wind <- wind %>%
+  dplyr::select(-X) %>%   # remove index column
+  mutate(
+    Date = parse_date_time(datetime,
+                           orders = c("ymd HMS", "ymd")),
+    Year = year(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE),
+    Wind10 = wind_speed,
+    Wind150 = Wind10 * (150 / 10)^alpha
+  )
+```
+
+``` {r load-script4, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(evd)
+
+annual_max <-
+wind |>
+group_by(Year) |>
+summarise(
+Max=max(Wind150)
+)
+
+gev_fit<-
+fgev(annual_max$Max)
+
+gev_fit
+```
+
+### Wind Resource Assessment Conclusion
+
+The wind resource assessment demonstrates that the Lí Ban Offshore Wind Farm site possesses a consistently energetic wind climate with a pronounced south-westerly directional bias and strong seasonal variability driven by North Atlantic weather systems. Extrapolated hub-height wind speeds indicate a resource suitable for large-scale offshore wind development, while the extreme value analysis highlights the importance of considering infrequent but severe storm events during structural design in accordance with international offshore wind design standards.
+
+## Section 3b: Waves
+### Step 1 – Prepare the wave dataset
+
+``` {r load-script5, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+wave <- wave %>%
+  dplyr::select(-X) %>%
+  mutate(
+    Date = parse_date_time(time,
+                           orders = c("ymd HMS", "ymd")),
+    Year = year(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE)
+  )
+```
+
+### Significant wave height (Hs) directional rose
+
+``` {r load-script6, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(openair)
+
+windRose(
+  wave,
+  ws = "hs",
+  wd = "mwd",
+  angle = 22.5,
+  breaks = c(0, 1, 2, 3, 4, 6, 8, 10, 15),
+  cols = "YlGnBu",
+  paddle = FALSE,
+  key.position = "right",
+  key.footer = "Hs (m)",
+  main = "Significant Wave Height Directional Rose"
+)
+```
+
+```{r load-script_1a, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(gt)
+
+annual_wave <- tibble(
+
+Statistic = c(
+"Mean",
+"Median",
+"Maximum",
+"Standard Deviation",
+"95th Percentile"
+),
+
+Hs = c(
+mean(wave$hs),
+median(wave$hs),
+max(wave$hs),
+sd(wave$hs),
+quantile(wave$hs,0.95)
+),
+
+Tp = c(
+mean(wave$tp),
+median(wave$tp),
+max(wave$tp),
+sd(wave$tp),
+quantile(wave$tp,0.95)
+)
+
+)
+
+annual_wave |>
+gt() |>
+fmt_number(columns=2:3,decimals=2) |>
+tab_header(
+title="Table 7. Annual Wave Statistics"
+)
+```
+
+### Step 4 – Monthly Statistics
+
+```{r load-script_1b, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+monthly_wave <-
+wave |>
+group_by(Month) |>
+summarise(
+
+Mean_Hs = mean(hs),
+
+Max_Hs = max(hs),
+
+Mean_Tp = mean(tp),
+
+SD_Hs = sd(hs),
+
+.groups="drop"
+
+)
+
+monthly_wave |>
+gt() |>
+fmt_number(everything(),decimals=2) |>
+tab_header(
+title="Table 8. Monthly Wave Statistics"
+)
+```
+
+### Step 5 – Hs Exceedance Table
+
+```{r load-script_1c, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+breaks <- c(0,0.5,1,2,3,4,5,6,8,10,15)
+
+wave_exceedance <-
+wave |>
+mutate(
+Bin=cut(hs,breaks=breaks)
+) |>
+count(Bin) |>
+mutate(
+Percent=100*n/sum(n)
+)
+
+wave_exceedance |>
+gt() |>
+fmt_number(columns=3,decimals=2) |>
+tab_header(
+title="Table 9. Significant Wave Height Exceedance"
+)
+```
+
+### Step 6 – Kernel Density Scatter (Hs vs Tp)
+
+```{r load-script_1d, echo=TRUE, message=FALSE, warning=FALSE, fig.width=7, fig.height=5}
+
+library(dplyr)
+library(ggplot2)
+
+# Sample data for plotting only
+set.seed(123)
+
+wave_plot <- wave %>%
+  dplyr::sample_n(min(10000, n()))
+
+ggplot(wave_plot,
+       aes(tp, hs)) +
+
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.5
+  ) +
+
+  geom_point(
+    alpha = 0.10,
+    size = 0.25
+  ) +
+
+  scale_fill_viridis_c(option = "C") +
+
+  labs(
+    x = "Peak Wave Period (s)",
+    y = "Significant Wave Height (m)",
+    title = "Joint Distribution of Significant Wave Height and Peak Wave Period"
+  ) +
+
+  theme_bw()
+
+rm(wave_plot)
+gc()
+```
+
+### Step 7 – Kernel Density (Hs vs MWD)
+```{r load-script_1e, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+
+set.seed(123)
+
+wave_plot <- wave %>%
+  sample_n(min(10000, n()))
+
+ggplot(
+  wave_plot,
+  aes(mwd, hs)
+) +
+
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.6
+  ) +
+
+  geom_point(
+    alpha = 0.15,
+    size = 0.3
+  ) +
+
+  labs(
+    x = "Mean Wave Direction (°)",
+    y = "Significant Wave Height (m)"
+  ) +
+
+  theme_bw()
+```
+
+### Step 8 – % Occurrence Table (Hs vs Tp)
+
+```{r load-script_1f, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+
+wave_occurrence <- wave %>%
+  mutate(
+    Hs_Bin = cut(
+      hs,
+      breaks = c(0, 1, 2, 3, 4, 6, 8, 12),
+      include.lowest = TRUE
+    ),
+    Tp_Bin = cut(
+      tp,
+      breaks = seq(0, 20, 2),
+      include.lowest = TRUE
+    )
+  ) %>%
+  count(Hs_Bin, Tp_Bin) %>%
+  mutate(
+    Percent = 100 * n / sum(n)
+  )
+
+wave_occurrence
+
+wave_matrix <- wave_occurrence %>%
+  dplyr::select(Hs_Bin, Tp_Bin, Percent) %>%
+  tidyr::pivot_wider(
+    names_from = Tp_Bin,
+    values_from = Percent,
+    values_fill = 0
+  )
+
+wave_matrix
+```
+
+### Step 9 – 50-Year Extreme Hs
+
+```{r load-script_1g, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(evd)
+
+annual_max_hs <-
+wave |>
+group_by(Year) |>
+summarise(
+Max_Hs=max(hs,na.rm=TRUE),
+.groups="drop"
+)
+
+gev_hs <- fgev(annual_max_hs$Max_Hs)
+
+summary(gev_hs)
+```
+The wave climate at the Lí Ban Offshore Wind Farm site is dominated by energetic south-westerly to westerly swell systems generated across the North Atlantic. The directional wave rose demonstrates that the highest significant wave heights are associated with these sectors, reflecting the long Atlantic fetch available before waves reach the Celtic Sea. Monthly statistics indicate a pronounced seasonal cycle, with the largest wave heights occurring during winter when extratropical cyclones are most frequent, while summer conditions are considerably calmer. The long-term dataset also provides a robust basis for estimating extreme wave conditions, supporting preliminary engineering design and site characterisation.
+
+
+
+## Section 3c – Water Levels
+### 3.3.1 Tidal Datums
+
+Ideally, tidal datums (HAT, MHWS, MHWN, MSL, MLWN, MLWS, LAT) are derived from a harmonic tidal analysis over at least a 19-year period. If you have hourly water-level data, you can estimate these datums. If not, you should clearly state that you are using published values or literature-based estimates appropriate for preliminary site assessment.
+
+```{r load-script_1h, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+tide <- read.csv("output/tide_compiled.csv")
+```
+
+### Step 1 – Parse the dates
+```{r load-script_1i, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+tide <- tide %>%
+  mutate(
+    Date = parse_date_time(time,
+                           orders = c("ymd HMS", "ymd")),
+    Year = year(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE)
+  )
+```
+
+### Step 2 – Estimate tidal datums
+```{r load-script_1j, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(gt)
+
+tidal_datums <- tibble(
+
+Datum = c(
+"HAT",
+"MHWS",
+"MHWN",
+"MSL",
+"MLWN",
+"MLWS",
+"LAT"
+),
+
+Elevation = c(
+
+max(tide$water_level),
+
+quantile(tide$water_level,0.95),
+
+quantile(tide$water_level,0.75),
+
+mean(tide$water_level),
+
+quantile(tide$water_level,0.25),
+
+quantile(tide$water_level,0.05),
+
+min(tide$water_level)
+
+)
+
+)
+
+tidal_datums |>
+gt() |>
+fmt_number(
+columns=Elevation,
+decimals=2
+) |>
+cols_label(
+Elevation="Water Level (m)"
+) |>
+tab_header(
+title=md("**Table 11. Estimated Tidal Datums at the Lí Ban Offshore Wind Farm Site**"),
+subtitle="Derived from hourly modelled water-level data"
+)
+```
+
+### Step 3 – Plot the water levels
+
+```{r load-script_1k, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(ggplot2)
+
+ggplot(
+tide,
+aes(Date,water_level)
+)+
+
+geom_line(
+linewidth=0.2,
+alpha=0.6
+)+
+
+labs(
+
+title="Hourly Water Levels",
+
+x="Year",
+
+y="Water Level (m)"
+
+)+
+
+theme_bw()
+```
+
+### Step 4 – Monthly statistics
+
+```{r load-script_1l, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+monthly_water <- tide %>%
+
+group_by(Month) %>%
+
+summarise(
+
+Mean = mean(water_level),
+
+Maximum = max(water_level),
+
+Minimum = min(water_level),
+
+SD = sd(water_level),
+
+.groups="drop"
+
+)
+
+monthly_water |>
+
+gt() |>
+
+fmt_number(
+everything(),
+decimals=2
+)
+```
+
+### Step 5 – Engineering discussion
+
+Hourly modelled water-level data were analysed to characterise the tidal regime at the Lí Ban Offshore Wind Farm site. Estimated tidal datums were derived from the available time series and provide an indication of the site's tidal range during the study period. As these values are based on modelled water levels rather than a full harmonic analysis over a standard 19-year tidal epoch, they should be regarded as approximate datums suitable for preliminary site characterisation rather than detailed engineering design.
+
+### Storm surge
+Atmospheric forcing can temporarily elevate sea level above predicted astronomical tides through storm surge. Along Ireland's south coast, storm surges are associated with intense Atlantic low-pressure systems and strong onshore winds during winter. Published studies indicate that storm surges of approximately 0.5–1.0 m can occur during severe events, with the highest still-water levels resulting from the coincidence of storm surge and spring high tides. These combined water levels are important for determining foundation elevations, marine operations and export cable landfall design.
+
+```{r load_script_1, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(gt)
+
+tidal_datums <- tibble(
+  Datum = c(
+    "Highest Astronomical Tide (HAT)",
+    "Mean High Water Springs (MHWS)",
+    "Mean High Water Neaps (MHWN)",
+    "Mean Sea Level (MSL)",
+    "Mean Low Water Neaps (MLWN)",
+    "Mean Low Water Springs (MLWS)",
+    "Lowest Astronomical Tide (LAT)"
+  ),
+  Elevation = c(
+    max(tide$water_level),
+    quantile(tide$water_level,0.95),
+    quantile(tide$water_level,0.75),
+    mean(tide$water_level),
+    quantile(tide$water_level,0.25),
+    quantile(tide$water_level,0.05),
+    min(tide$water_level)
+  )
+)
+
+tidal_datums %>%
+  gt() %>%
+  fmt_number(columns = Elevation, decimals = 2) %>%
+  cols_label(
+    Elevation = "Elevation (m)"
+  ) %>%
+  tab_header(
+    title = md("**Table 12. Estimated Tidal Datums for the Lí Ban Site**")
+  )
+```
+
+## Section 3d: Currents
+
+### 3.4.1 Prepare the current data
+
+```{r load_script_prepare_current data, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+tide <- tide %>%
+  mutate(
+    Date = parse_date_time(time,
+                           orders = c("ymd HMS","ymd")),
+    Year = lubridate::year(Date),
+    Month = lubridate::month(Date,
+                             label = TRUE,
+                             abbr = TRUE)
+  )
+```
+
+
+### 3.4.2 Current Directional Rose
+
+```{r load_script_Current_Directional_Rose, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(openair)
+
+windRose(
+  mydata = tide,
+  ws = "c_speed",
+  wd = "c_dir",
+  angle = 22.5,
+  breaks = c(0,0.1,0.2,0.3,0.4,0.6,1.0),
+  paddle = FALSE,
+  key.footer = "Current speed (m/s)",
+  main = "Fig. Current directional rose for the Lí Ban Offshore Wind Farm site showing the directional distribution of modelled current speeds."
+)
+```
+
+### 3.4.3 Annual Statistics
+
+```{r load_script_Current_Annual_Statistics, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(gt)
+
+annual_current <- tibble(
+
+Statistic = c(
+"Mean",
+"Median",
+"Maximum",
+"Minimum",
+"Standard Deviation",
+"95th Percentile"
+),
+
+Speed = c(
+
+mean(tide$c_speed),
+
+median(tide$c_speed),
+
+max(tide$c_speed),
+
+min(tide$c_speed),
+
+sd(tide$c_speed),
+
+quantile(tide$c_speed,0.95)
+
+)
+
+)
+
+annual_current |>
+gt() |>
+fmt_number(columns=Speed,decimals=3) |>
+tab_header(
+title=md("**Annual Current Speed Statistics**")
+)
+```
+
+
+### 3.4.4 Monthly Statistics
+
+```{r load_script_Current_Monthly_Statistics, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+monthly_current <- tide |>
+
+group_by(Month) |>
+
+summarise(
+
+Mean = mean(c_speed),
+
+Maximum = max(c_speed),
+
+Minimum = min(c_speed),
+
+SD = sd(c_speed),
+
+.groups="drop"
+
+)
+
+monthly_current |>
+
+gt() |>
+
+fmt_number(
+columns=2:5,
+decimals=3
+) |>
+
+tab_header(
+title=md("**Monthly Current Speed Statistics**")
+)
+```
+
+### 3.4.5 Current Speed Exceedance
+
+```{r load_script_Current_Speed_Exceedance, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+breaks <- seq(
+0,
+ceiling(max(tide$c_speed)*20)/20,
+by=0.05
+)
+
+current_exceedance <- tibble(
+
+Threshold = breaks,
+
+Percent_Exceedance = sapply(
+
+breaks,
+
+function(x){
+
+100*mean(tide$c_speed>x)
+
+}
+
+)
+
+)
+
+current_exceedance |>
+
+gt() |>
+
+fmt_number(
+columns=2,
+decimals=1
+) |>
+
+cols_label(
+
+Threshold="Speed (m/s)",
+
+Percent_Exceedance="% Exceedance"
+
+) |>
+
+tab_header(
+title=md("**Current Speed Exceedance**")
+)
+```
+
+### 3.4.6 Current Speed Distribution
+
+```{r load_script_Current_Speed_Distribution, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(ggplot2)
+
+ggplot(
+tide,
+aes(c_speed)
+)+
+
+geom_histogram(
+bins=30
+)+
+
+labs(
+
+title="Distribution of Current Speed",
+
+x="Current Speed (m/s)",
+
+y="Frequency"
+
+)+
+
+theme_bw()
+```
+
+### 3.4.7 Current Speed Time Series
+```{r load_script_Current_Speed_Time_Series, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+ggplot(
+tide,
+aes(Date,c_speed)
+)+
+geom_line(alpha=0.3)+
+labs(
+title="Current Speed Time Series",
+x="Year",
+y="Current Speed (m/s)"
+)+
+theme_bw()
+```
+
+### Engineering Interpretation
+Modelled current speeds at the Lí Ban Offshore Wind Farm site are generally low to moderate, with peak velocities associated with spring tidal conditions. The current rose demonstrates that currents exhibit a clear bidirectional tidal pattern, reflecting the semi-diurnal tidal regime of the Celtic Sea. Annual statistics indicate relatively consistent current magnitudes throughout the study period, although seasonal variability is evident in the monthly summary statistics.
+
+The exceedance analysis shows that the majority of current speeds remain below moderate thresholds, suggesting favourable conditions for offshore construction and maintenance operations. However, higher current velocities occurring during spring tides should be considered during installation planning, vessel station-keeping and scour assessment around monopile or jacket foundations.
+
+
+## Section 3e: Joint conditions
+### Create a common dataset
+
+```{r load_script_Create_common_dataset, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+wind <- wind %>%
+  mutate(Date = parse_date_time(datetime,
+                                orders = c("ymd HMS","ymd")))
+
+wave <- wave %>%
+  mutate(Date = parse_date_time(time,
+                                orders = c("ymd HMS","ymd")))
+
+joint <- dplyr::inner_join(
+  wind,
+  wave,
+  by = "Date"
+)
+```
+
+### 3.5.1 Scatter Plot with Kernel Density
+
+```{r load_script_Random_sample, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(dplyr)
+
+set.seed(123)
+
+joint_plot <- joint %>%
+  dplyr::sample_n(min(10000, n()))
+```
+
+```{r load_script_Scatter_Plot_Kernel_Density, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(ggplot2)
+
+ggplot(joint_plot,
+       aes(wind_speed, hs)) +
+
+  geom_point(
+    alpha = 0.15,
+    size = 0.4
+  ) +
+
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.5
+  ) +
+
+  scale_fill_viridis_c() +
+
+  labs(
+    x = "10 m Wind Speed (m/s)",
+    y = "Significant Wave Height (m)",
+    title = "Joint Distribution of Wind Speed and Significant Wave Height"
+  ) +
+
+  theme_bw()
+```
+
+### Engineering Interpretation
+The joint distribution demonstrates a clear positive relationship between wind speed and significant wave height. Moderate wave heights occur across a broad range of wind speeds, while the largest sea states are associated with strong winds generated during Atlantic storm events. The density contours indicate that the most frequently occurring environmental conditions correspond to moderate winds (approximately 6–12 m/s) and significant wave heights between 1 and 3 m.
+
+### 3.5.2 Create Hub-height Wind Bins
+
+```{r load_script_Hub-height_Wind_Bins, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+joint <- joint |>
+
+mutate(
+
+WindBin = cut(
+
+Wind150,
+
+breaks=seq(0,40,2),
+
+include.lowest=TRUE
+
+),
+
+HsBin = cut(
+
+hs,
+
+breaks=c(0,1,2,3,4,6,8,12),
+
+include.lowest=TRUE
+
+),
+
+TpBin = cut(
+
+tp,
+
+breaks=seq(0,20,2),
+
+include.lowest=TRUE
+
+)
+
+)
+```
+
+
+### Joint Probability Table
+```{r load_script_Joint_Probability_Table, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+joint_prob <- joint |>
+
+count(
+
+WindBin,
+
+HsBin,
+
+TpBin
+
+) |>
+
+mutate(
+
+Percent=
+
+100*n/sum(n)
+
+)
+```
+
+### Display Only Two Wind-Speed Classes
+#### 1–3 m/s
+
+```{r load_script_Display_Wind-Speed_Class_1-3, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+library(gt)
+
+joint_prob |>
+
+filter(
+
+WindBin=="(0,2]"
+
+) |>
+
+dplyr::select(
+
+HsBin,
+
+TpBin,
+
+Percent
+
+) |>
+
+tidyr::pivot_wider(
+
+names_from=TpBin,
+
+values_from=Percent,
+
+values_fill=0
+
+) |>
+
+gt() |>
+
+fmt_number(
+columns=-HsBin,
+decimals=2
+) |>
+
+tab_header(
+title=md("**Joint Occurrence (%) for Hub Wind Speed 0–2 m/s**")
+)
+```
+
+#### 3–5 m/s
+
+```{r load_script_Display_Wind-Speed_Class_3-5, echo=TRUE, message=FALSE, include=TRUE, warning=FALSE}
+joint_prob |>
+
+filter(
+
+WindBin=="(2,4]"
+
+) |>
+
+dplyr::select(
+
+HsBin,
+
+TpBin,
+
+Percent
+
+) |>
+
+tidyr::pivot_wider(
+
+names_from=TpBin,
+
+values_from=Percent,
+
+values_fill=0
+
+) |>
+
+gt() |>
+
+fmt_number(
+columns=-HsBin,
+decimals=2
+) |>
+
+tab_header(
+title=md("**Joint Occurrence (%) for Hub Wind Speed 2–4 m/s**")
+)
+```
+
+
+## Section 4: Recommendations for Further Data Collection
+
+### 4.1 Introduction
+
+The metocean datasets analysed in this report provide an appropriate basis for the preliminary site characterisation of the proposed Lí Ban (Maritime Area B) offshore wind farm. The ERA5 reanalysis and modelled hydrodynamic datasets provide long-term spatially consistent information on wind climate, wave conditions, currents and water levels, enabling the identification of key environmental characteristics and the estimation of extreme design conditions.
+
+However, these datasets remain numerical model products with finite spatial and temporal resolution. Prior to detailed engineering design, construction and certification, a comprehensive site-specific metocean measurement programme would be required to reduce uncertainty and satisfy international offshore wind design standards such as IEC 61400-3-1, DNV-ST-0437 and DNV-RP-C205.
+
+
+### 4.2 Wind Measurements
+
+Although ERA5 provides a reliable representation of the regional wind climate, it cannot fully resolve site-specific atmospheric processes or accurately represent turbulence within the turbine rotor envelope.
+
+A floating offshore meteorological mast or floating LiDAR system should therefore be deployed for a minimum of 12–24 months to measure:
+
+* Wind speed at multiple elevations
+* Wind direction
+* Turbulence intensity
+* Vertical wind shear
+* Wind veer
+* Air temperature
+* Atmospheric pressure
+* Relative humidity
+
+These observations would allow the development of a site-specific wind resource assessment, calibration of ERA5 reanalysis data using Measure-Correlate-Predict (MCP) techniques, and estimation of long-term energy production.
+
+
+### 4.3 Wave Measurements
+
+The present assessment used ERA5 wave parameters to characterise significant wave height, peak period and mean wave direction. Detailed engineering design requires substantially more information regarding the complete wave spectrum.
+
+A directional wave buoy should therefore be deployed to measure:
+
+* Significant wave height (Hs)
+* Maximum wave height (Hmax)
+* Peak period (Tp)
+* Mean zero-crossing period (Tz)
+* Wave direction
+* Directional spreading
+* Spectral wave energy
+
+These observations are required for fatigue analysis, structural dynamics, vessel operability studies and the design of offshore foundations.
+
+
+### 4.4 Water Levels and Storm Surge
+
+Water levels used within this study provide a useful indication of tidal variability but do not constitute an official tidal datum record.
+
+Further observations should include:
+
+* Long-term tide gauge deployment
+* Harmonic tidal analysis
+* Storm surge monitoring
+* Atmospheric pressure observations
+* Extreme still-water level analysis
+
+These datasets are necessary for determining design water levels, cable landfall elevations and safe installation windows.
+
+
+### 4.5 Current Measurements
+
+Current measurements derived from hydrodynamic modelling provide an initial estimate of tidal circulation but cannot fully capture local bathymetric effects.
+
+A seabed-mounted Acoustic Doppler Current Profiler (ADCP) should therefore be deployed to measure:
+
+* Current speed
+* Current direction
+* Vertical current profile
+* Spring-neap variability
+* Residual circulation
+* Near-bed velocities
+
+These measurements are essential for scour assessment, cable stability, vessel operations and foundation design.
+
+
+### 4.6 Additional Metocean Variables
+
+Several important environmental variables were beyond the scope of this preliminary assessment but would be required during detailed design.
+
+These include:
+
+* Extreme individual wave heights (Hmax)
+* Wave spectral characteristics
+* Wave breaking probability
+* Wind gusts
+* Turbulence intensity
+* Vertical wind shear
+* Air density
+* Sea surface temperature
+* Water temperature profiles
+* Salinity
+* Density stratification
+* Visibility
+* Fog occurrence
+* Lightning frequency
+* Marine icing (where applicable)
+* Oceanographic fronts
+* Sediment transport
+* Suspended sediment concentration
+
+Many of these parameters influence structural loading, corrosion rates, cable burial design, marine operations and long-term asset reliability.
+
+
+### 4.7 Geophysical and Geotechnical Surveys
+
+In addition to metocean observations, detailed offshore wind development requires extensive site investigation.
+
+Typical surveys include:
+
+* Multibeam bathymetry
+* Side-scan sonar
+* Sub-bottom profiling
+* Magnetometer survey
+* Vibrocores
+* Cone Penetration Tests (CPT)
+* Boreholes
+* Laboratory soil testing
+
+These surveys provide the information required for foundation selection, pile design, cable routing and scour protection.
+
+
+### 4.8 Overall Assessment
+
+The datasets analysed within this study are considered suitable for preliminary site screening and early-stage offshore wind resource assessment. They provide sufficient information to characterise the regional wind, wave, current and water-level climate and identify the principal environmental conditions affecting development of the Lí Ban Offshore Wind Farm.
+
+Nevertheless, detailed engineering design should rely primarily on long-term site-specific measurements supplemented by validated numerical models. The integration of dedicated offshore metocean monitoring with comprehensive geophysical and geotechnical investigations will substantially reduce uncertainty, improve design reliability and ensure compliance with international offshore wind engineering standards.
+
+# Final Conclusions
+
+This report presented a preliminary metocean site characterisation for the proposed Lí Ban (Maritime Area B) offshore wind farm located in the Celtic Sea approximately 29 km offshore from County Waterford. Using ERA5 reanalysis data together with modelled wave, current and water-level datasets, the principal environmental conditions influencing offshore wind development were evaluated through analyses of wind climate, wave climate, water levels, tidal currents and joint environmental conditions.
+
+The assessment indicates that the Lí Ban site is highly suitable for offshore wind development. The location benefits from a strong and persistent offshore wind resource, with elevated hub-height wind speeds providing favourable conditions for high annual energy production. Wind directions are dominated by south-westerly and westerly airflow associated with the prevailing North Atlantic weather systems, producing a consistent and predictable wind climate. The offshore location also experiences lower surface roughness and reduced turbulence compared with onshore environments, improving turbine performance and reducing fatigue loading.
+
+Wave conditions are representative of an energetic Atlantic environment but remain within the range routinely encountered by modern fixed-bottom offshore wind farms operating throughout the North Sea and north-west Europe. Although severe winter storms generate large significant wave heights and extreme environmental loading, these conditions are well understood within current offshore engineering practice and can be accommodated through appropriate foundation design, structural analysis and operational planning. The joint wind-wave analysis demonstrates that the most frequently occurring sea states correspond to moderate wind speeds and wave heights, providing favourable operating conditions for much of the year.
+
+Current speeds at the site are generally moderate and are dominated by semi-diurnal tidal circulation. The observed current magnitudes are unlikely to impose significant operational constraints during routine maintenance activities but should be incorporated into detailed scour assessments, installation planning and cable stability analyses. Similarly, the tidal range and storm surge characteristics identified during this assessment highlight the importance of considering extreme still-water levels during foundation and export cable design.
+
+Several strategic factors further enhance the suitability of the Lí Ban site. The development area forms part of Ireland's South Coast Designated Maritime Area Plan (SC-DMAP), providing an established planning framework for offshore renewable energy development. The site's location in relatively shallow continental shelf waters is favourable for fixed-bottom foundation systems while maintaining sufficient separation from the coastline to minimise visual impacts. In addition, proximity to the south coast offers practical advantages for construction logistics, operation and maintenance activities, and future connection to Ireland's expanding offshore electricity transmission infrastructure.
+
+Despite these favourable characteristics, several limitations should be recognised. The assessment is based primarily on reanalysis and numerical model datasets rather than long-term site-specific measurements. While these datasets are appropriate for early-stage feasibility studies, they cannot fully represent local atmospheric, oceanographic and bathymetric variability. Wind shear, turbulence intensity, gust characteristics and wave spectral properties have not been directly measured and therefore introduce uncertainty into estimates of structural loading and long-term energy production. Likewise, the tidal datums presented are derived from modelled water-level data rather than harmonic analysis of long-term tide gauge observations.
+
+The energetic Atlantic wave climate also presents engineering and operational challenges. Extreme winter storms may restrict construction windows, increase downtime during maintenance operations and require robust structural design to withstand high wind and wave loading. Furthermore, seabed conditions, sediment transport processes and local scour potential require detailed geophysical and geotechnical investigation before final foundation selection.
+
+Overall, the results demonstrate that the Lí Ban Offshore Wind Farm site possesses the environmental characteristics expected of a commercially attractive offshore wind development area. The combination of an excellent wind resource, manageable metocean conditions, favourable water depths and strategic location within Ireland's offshore renewable energy programme supports its suitability for development. The analyses presented in this report provide a robust basis for preliminary site characterisation; however, progression to detailed design should be supported by comprehensive site-specific metocean measurements together with geophysical and geotechnical investigations to reduce uncertainty and satisfy international offshore wind design standards.
+
+
+# Bibliography
+
+Copernicus Climate Change Service (C3S). (2024). *ERA5 hourly data on single levels from 1940 to present*. European Centre for Medium-Range Weather Forecasts (ECMWF). https://cds.climate.copernicus.eu/
+
+DNV. (2021). *DNV-RP-C205: Environmental conditions and environmental loads*. DNV.
+
+DNV. (2021). *DNV-ST-0437: Loads and site conditions for wind turbines*. DNV.
+
+European Commission. (2020). *EU Offshore Renewable Energy Strategy*. Publications Office of the European Union.
+
+European Centre for Medium-Range Weather Forecasts (ECMWF). (2023). *ERA5 Reanalysis Documentation*. https://confluence.ecmwf.int/display/CKB/ERA5
+
+IEC. (2019). *IEC 61400-3-1: Wind energy generation systems – Part 3-1: Design requirements for fixed offshore wind turbines*. International Electrotechnical Commission.
+
+Irish Government. (2024). *South Coast Designated Maritime Area Plan (SC-DMAP)*. Department of the Environment, Climate and Communications.
+
+Marine Institute. (2024). *Ireland's Marine Atlas*. https://marineinstitute.maps.arcgis.com/apps/instant/atlas/
+
+Marine Institute. (2024). *INFOMAR Programme*. https://www.infomar.ie/
+
+O'Sullivan, J. J., & Gault, J. (2018). *Ocean wave climate of Ireland*. Marine Institute, Galway, Ireland.
+
+OpenAir Project. (2024). *openair: Open-source tools for air quality and environmental data analysis (R package)*. https://openair-project.github.io/
+
+Pebesma, E. (2018). *Simple Features for R: Standardized support for spatial vector data*. *The R Journal, 10*(1), 439–446.
+
+R Core Team. (2025). *R: A language and environment for statistical computing*. R Foundation for Statistical Computing. https://www.r-project.org/
+
+South Coast DMAP Project Team. (2024). *South Coast Designated Maritime Area Plan: Strategic Environmental Assessment and Supporting Documentation*. Government of Ireland.
+
+Wickham, H., François, R., Henry, L., Müller, K., & Vaughan, D. (2023). *dplyr: A grammar of data manipulation* (R package). https://cran.r-project.org/package=dplyr
+
+Wickham, H., Vaughan, D., & Girlich, M. (2024). *tidyr: Tidy messy data* (R package). https://cran.r-project.org/package=tidyr
+
+Wickham, H. (2016). *ggplot2: Elegant graphics for data analysis*. Springer-Verlag New York.
+
+Wood, S. N. (2017). *Generalized additive models: An introduction with R* (2nd ed.). Chapman & Hall/CRC.
+
+Creane, S. (2023). *Reference Site Technical Report A: Reference Site 1 Preliminary Metocean Site Conditions Assessment*. IDEA-IRL Project, MaREI Research Centre, Sustainable Energy Authority of Ireland.
